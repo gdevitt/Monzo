@@ -107,14 +107,14 @@ These SQL files are written for **Google BigQuery** syntax, featuring:
 - `STRING` and `INT64` data types
 - `TIMESTAMP` with `CURRENT_TIMESTAMP()` function
 - `PARTITION BY DATE()` for table partitioning
-- `PRIMARY KEY ... NOT ENFORCED` constraints
+- `OPTIONS(description=...)` for table documentation
 - `CREATE OR REPLACE VIEW` statements
 
 **For other databases (PostgreSQL, MySQL, Snowflake, etc.)**, you may need to adjust:
 - Data type names (STRING → VARCHAR, INT64 → BIGINT)
 - Timestamp functions
 - Partitioning syntax
-- Primary key enforcement
+- Table documentation syntax
 
 ## Usage in BI Tools
 

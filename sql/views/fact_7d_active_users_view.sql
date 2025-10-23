@@ -2,7 +2,7 @@
 -- Purpose: Enhanced view of 7-day active user metrics with trend indicators and time dimensions
 -- This view is optimized for business KPI dashboards and executive reporting
 
-CREATE OR REPLACE VIEW fact_7d_active_users_view AS
+CREATE OR REPLACE VIEW GD_take_home_task.fact_7d_active_users_view AS
 SELECT
   metric_date,
   total_users_with_open_accounts,
@@ -50,5 +50,6 @@ SELECT
   
   load_timestamp
 FROM
-  fact_7d_active_users
+  GD_take_home_task.fact_7d_active_users
+WHERE metric_date = CURRENT_DATE()
 ;
