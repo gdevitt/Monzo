@@ -1,0 +1,19 @@
+# Temporary files
+*.tmp
+*.temp
+/tmp/
+
+# Build artifacts
+*.log
+*.cache
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
