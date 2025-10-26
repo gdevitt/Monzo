@@ -35,6 +35,17 @@ OPTIONS(
 );
 
 -- ETL Query to populate fact_7d_active_users table
+-- This query implements the 7d_active_users metric as defined:
+-- Users with transactions in last 7 days / Users with at least one open account
+-- Designed for historical consistency and can be run for any date
+
+-- USAGE: Replace @TARGET_DATE with the specific date you want to calculate
+-- For daily ETL: SET @TARGET_DATE = CURRENT_DATE()
+-- For historical: SET @TARGET_DATE = '2019-01-01'
+
+-- Set date as 2020-08-11 for example
+DECLARE TARGET_DATE DATE DEFAULT '2020-08-11';
+
 INSERT INTO GD_take_home_task.fact_7d_active_users (
   metric_date,
   total_users_with_open_accounts,
@@ -49,137 +60,177 @@ INSERT INTO GD_take_home_task.fact_7d_active_users (
   load_timestamp
 )
 
-WITH date_spine AS (
-  -- Generate date for daily metric calculation
-  SELECT CURRENT_DATE() AS metric_date
+WITH 
+-- Define the target date and 7-day window
+date_params AS (
+  SELECT 
+    TARGET_DATE AS metric_date,
+    DATE_SUB(TARGET_DATE, INTERVAL 6 DAY) AS window_start_date,
+    TARGET_DATE AS window_end_date
 ),
 
--- Get all open accounts as of the metric date
-open_accounts AS (
-  SELECT DISTINCT
-    ac.account_id_hashed,
-    ac.user_id_hashed,
-    ac.account_type
-  FROM `analytics-take-home-test.monzo_datawarehouse.account_created` ac
+-- Get all accounts with their temporal status as of the metric date
+accounts_with_status AS (
+  SELECT 
+    acc.account_id_hashed,
+    acc.user_id_hashed,
+    acc.account_type,
+    acc.created_ts,
+    
+    -- Get the most recent closure before or on metric date
+    MAX(CASE 
+      WHEN DATE(acl.closed_ts) <= TARGET_DATE THEN acl.closed_ts 
+      ELSE NULL 
+    END) AS last_closed_before_metric_date,
+    
+    -- Get the most recent reopening before or on metric date
+    MAX(CASE 
+      WHEN DATE(ar.reopened_ts) <= TARGET_DATE THEN ar.reopened_ts 
+      ELSE NULL 
+    END) AS last_reopened_before_metric_date,
+    
+    -- Determine account status as of metric date
+    CASE 
+      WHEN MAX(CASE WHEN DATE(acl.closed_ts) <= TARGET_DATE THEN acl.closed_ts END) IS NULL THEN 'OPEN'
+      WHEN MAX(CASE WHEN DATE(ar.reopened_ts) <= TARGET_DATE THEN ar.reopened_ts END) IS NULL THEN 'CLOSED'
+      WHEN MAX(CASE WHEN DATE(ar.reopened_ts) <= TARGET_DATE THEN ar.reopened_ts END) > 
+           MAX(CASE WHEN DATE(acl.closed_ts) <= TARGET_DATE THEN acl.closed_ts END) THEN 'OPEN'
+      ELSE 'CLOSED'
+    END AS account_status_on_metric_date
+    
+  FROM `analytics-take-home-test.monzo_datawarehouse.account_created` acc
   LEFT JOIN `analytics-take-home-test.monzo_datawarehouse.account_closed` acl
-    ON ac.account_id_hashed = acl.account_id_hashed
+    ON acc.account_id_hashed = acl.account_id_hashed
   LEFT JOIN `analytics-take-home-test.monzo_datawarehouse.account_reopened` ar
-    ON ac.account_id_hashed = ar.account_id_hashed
+    ON acc.account_id_hashed = ar.account_id_hashed
   WHERE 
-    -- Account is currently open based on closure/reopening logic
-    (acl.closed_ts IS NULL OR 
-     (ar.reopened_ts IS NOT NULL AND ar.reopened_ts > acl.closed_ts))
+    -- Only include accounts created before or on the metric date
+    DATE(acc.created_ts) <= TARGET_DATE
+  GROUP BY 
+    acc.account_id_hashed, acc.user_id_hashed, acc.account_type, acc.created_ts
 ),
 
--- Get users with open accounts
+-- Get only accounts that are OPEN as of the metric date
+open_accounts_on_metric_date AS (
+  SELECT 
+    account_id_hashed,
+    user_id_hashed,
+    account_type
+  FROM accounts_with_status
+  WHERE account_status_on_metric_date = 'OPEN'
+),
+
+-- Get users who have at least one open account (denominator for the metric)
 users_with_open_accounts AS (
   SELECT DISTINCT 
     user_id_hashed,
-    COUNT(DISTINCT account_id_hashed) AS open_accounts_count
-  FROM open_accounts
+    COUNT(DISTINCT account_id_hashed) AS open_account_count
+  FROM open_accounts_on_metric_date
   GROUP BY user_id_hashed
 ),
 
--- Get accounts with transactions in the last 7 days
-accounts_active_7d AS (
+-- Get transactions in the 7-day window for open accounts only
+transactions_7d_window AS (
   SELECT 
     att.account_id_hashed,
     oa.user_id_hashed,
-    SUM(att.transactions_num) AS transactions_7d
+    SUM(att.transactions_num) AS account_transactions_7d
   FROM `analytics-take-home-test.monzo_datawarehouse.account_transactions` att
-  INNER JOIN open_accounts oa 
+  INNER JOIN open_accounts_on_metric_date oa 
     ON att.account_id_hashed = oa.account_id_hashed
+  CROSS JOIN date_params dp
   WHERE 
-    att.date BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY) AND CURRENT_DATE()
+    att.date BETWEEN dp.window_start_date AND dp.window_end_date
     AND att.transactions_num > 0
   GROUP BY att.account_id_hashed, oa.user_id_hashed
 ),
 
--- Get users with transactions in the last 7 days
+-- Get users who had transactions in the 7-day window (numerator for the metric)
 users_active_7d AS (
   SELECT 
     user_id_hashed,
-    COUNT(DISTINCT account_id_hashed) AS active_accounts_count,
-    SUM(transactions_7d) AS user_transactions_7d
-  FROM accounts_active_7d
+    COUNT(DISTINCT account_id_hashed) AS active_account_count,
+    SUM(account_transactions_7d) AS user_total_transactions_7d
+  FROM transactions_7d_window
   GROUP BY user_id_hashed
 ),
 
--- Get total transactions in last 7 days across all accounts
-total_transactions_7d AS (
-  SELECT 
-    SUM(att.transactions_num) AS total_transactions_7d
-  FROM `analytics-take-home-test.monzo_datawarehouse.account_transactions` att
-  INNER JOIN open_accounts oa 
-    ON att.account_id_hashed = oa.account_id_hashed
-  WHERE 
-    att.date BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY) AND CURRENT_DATE()
-    AND att.transactions_num > 0
+-- Get accounts that had transactions in the 7-day window
+accounts_active_7d AS (
+  SELECT DISTINCT 
+    account_id_hashed,
+    user_id_hashed,
+    account_transactions_7d
+  FROM transactions_7d_window
 ),
 
--- Calculate final metrics
-metrics AS (
+-- Calculate aggregate metrics
+aggregated_metrics AS (
   SELECT 
-    ds.metric_date,
+    dp.metric_date,
     
-    -- User metrics
+    -- Denominator: Users with at least one open account
     COUNT(DISTINCT uoa.user_id_hashed) AS total_users_with_open_accounts,
+    
+    -- Numerator: Users with transactions in 7-day window
     COUNT(DISTINCT ua7d.user_id_hashed) AS active_users_7d,
     
-    -- Account metrics
+    -- Account-level metrics for additional insights
     COUNT(DISTINCT oa.account_id_hashed) AS total_open_accounts,
     COUNT(DISTINCT aa7d.account_id_hashed) AS active_accounts_7d,
     
-    -- Transaction metrics
-    COALESCE(tt7d.total_transactions_7d, 0) AS total_transactions_7d,
+    -- Transaction volume metrics
+    COALESCE(SUM(ua7d.user_total_transactions_7d), 0) AS total_transactions_7d
     
-    -- Averages
-    CASE 
-      WHEN COUNT(DISTINCT ua7d.user_id_hashed) > 0 
-      THEN ROUND(COALESCE(tt7d.total_transactions_7d, 0) / COUNT(DISTINCT ua7d.user_id_hashed), 2)
-      ELSE 0 
-    END AS avg_transactions_per_active_user,
-    
-    CASE 
-      WHEN COUNT(DISTINCT aa7d.account_id_hashed) > 0 
-      THEN ROUND(COALESCE(tt7d.total_transactions_7d, 0) / COUNT(DISTINCT aa7d.account_id_hashed), 2)
-      ELSE 0 
-    END AS avg_transactions_per_active_account
-    
-  FROM date_spine ds
+  FROM date_params dp
   CROSS JOIN users_with_open_accounts uoa
-  CROSS JOIN open_accounts oa
-  LEFT JOIN users_active_7d ua7d ON uoa.user_id_hashed = ua7d.user_id_hashed
-  LEFT JOIN accounts_active_7d aa7d ON oa.account_id_hashed = aa7d.account_id_hashed
-  CROSS JOIN total_transactions_7d tt7d
-  GROUP BY ds.metric_date, tt7d.total_transactions_7d
+  LEFT JOIN users_active_7d ua7d 
+    ON uoa.user_id_hashed = ua7d.user_id_hashed
+  CROSS JOIN open_accounts_on_metric_date oa
+  LEFT JOIN accounts_active_7d aa7d 
+    ON oa.account_id_hashed = aa7d.account_id_hashed
+  GROUP BY dp.metric_date
 )
 
+-- Final output with calculated rates and averages
 SELECT 
   metric_date,
   total_users_with_open_accounts,
   active_users_7d,
   
-  -- Calculate active rate with safe division
+  -- The core 7d_active_users metric
   CASE 
     WHEN total_users_with_open_accounts > 0 
-    THEN ROUND(CAST(active_users_7d AS FLOAT64) / CAST(total_users_with_open_accounts AS FLOAT64), 4)
+    THEN ROUND(CAST(active_users_7d AS FLOAT64) / CAST(total_users_with_open_accounts AS FLOAT64), 6)
     ELSE 0.0 
   END AS active_rate_7d,
   
   total_open_accounts,
   active_accounts_7d,
   
-  -- Calculate active account rate with safe division
+  -- Account-level active rate for additional insights
   CASE 
     WHEN total_open_accounts > 0 
-    THEN ROUND(CAST(active_accounts_7d AS FLOAT64) / CAST(total_open_accounts AS FLOAT64), 4)
+    THEN ROUND(CAST(active_accounts_7d AS FLOAT64) / CAST(total_open_accounts AS FLOAT64), 6)
     ELSE 0.0 
   END AS active_accounts_rate_7d,
   
   total_transactions_7d,
-  avg_transactions_per_active_user,
-  avg_transactions_per_active_account,
+  
+  -- Average transactions per active user
+  CASE 
+    WHEN active_users_7d > 0 
+    THEN ROUND(CAST(total_transactions_7d AS FLOAT64) / CAST(active_users_7d AS FLOAT64), 2)
+    ELSE 0.0 
+  END AS avg_transactions_per_active_user,
+  
+  -- Average transactions per active account
+  CASE 
+    WHEN active_accounts_7d > 0 
+    THEN ROUND(CAST(total_transactions_7d AS FLOAT64) / CAST(active_accounts_7d AS FLOAT64), 2)
+    ELSE 0.0 
+  END AS avg_transactions_per_active_account,
+  
   CURRENT_TIMESTAMP() AS load_timestamp
 
-FROM metrics;
+FROM aggregated_metrics;

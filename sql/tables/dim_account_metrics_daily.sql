@@ -15,32 +15,38 @@ Pull Request ID: provide GIT pull request if available.
 
 -- DROP TABLE GD_take_home_task.account_detail_customer;
 
-CREATE TABLE GD_take_home_task.dim_account_metrics_daily
-(
-  metric_date DATE NOT NULL,
-  account_id_hashed STRING NOT NULL,
-  user_id_hashed STRING NOT NULL,
-  account_type STRING,
-  account_status STRING NOT NULL,  -- 'OPEN', 'CLOSED' as of metric_date
-  days_since_creation INT64,
-  days_since_last_closure INT64,
-  days_since_last_reopening INT64,
-  is_active_7d BOOLEAN,  -- Had transactions in last 7 days
-  is_active_30d BOOLEAN,  -- Had transactions in last 30 days
-  cumulative_transactions INT64,  -- Total transactions since account creation
-  transactions_last_7d INT64,
-  transactions_last_30d INT64,
-  load_timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP()
-)
-PARTITION BY metric_date
-OPTIONS(
-  description="Daily snapshot of account metrics for historical analysis and trending"
-);
+-- CREATE TABLE GD_take_home_task.dim_account_metrics_daily
+-- (
+--   metric_date DATE NOT NULL,
+--   account_id_hashed STRING NOT NULL,
+--   user_id_hashed STRING NOT NULL,
+--   account_type STRING,
+--   account_status STRING NOT NULL,  -- 'OPEN', 'CLOSED' as of metric_date
+--   days_since_creation INT64,
+--   days_since_last_closure INT64,
+--   days_since_last_reopening INT64,
+--   is_active_7d BOOLEAN,  -- Had transactions in last 7 days
+--   is_active_30d BOOLEAN,  -- Had transactions in last 30 days
+--   cumulative_transactions INT64,  -- Total transactions since account creation
+--   transactions_last_7d INT64,
+--   transactions_last_30d INT64,
+--   load_timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP()
+-- )
+-- PARTITION BY metric_date
+-- OPTIONS(
+--   description="Daily snapshot of account metrics for historical analysis and trending"
+-- );
 
 -- ETL Query to populate dim_account_metrics_daily table
--- This query should be run daily to create snapshots of account metrics
+-- BACKFILL VERSION: This query runs for date range 2020-08-01 to 2020-08-12
+-- This creates daily snapshots of account metrics for historical analysis
 
-INSERT INTO dim_account_metrics_daily (
+-- For single date: DECLARE TARGET_DATE DATE DEFAULT '2020-08-12';
+-- For backfill: Use date range generation below
+
+TRUNCATE TABLE GD_take_home_task.dim_account_metrics_daily;
+
+INSERT INTO GD_take_home_task.dim_account_metrics_daily (
   metric_date,
   account_id_hashed,
   user_id_hashed,
@@ -57,9 +63,11 @@ INSERT INTO dim_account_metrics_daily (
   load_timestamp
 )
 
-WITH date_spine AS (
-  -- Generate date range for daily snapshots
-  SELECT CURRENT_DATE() AS metric_date
+WITH 
+-- Generate date range for backfill: 2020-08-01 to 2020-08-12 (12 days)
+date_spine AS (
+  SELECT date_value AS metric_date
+  FROM UNNEST(GENERATE_DATE_ARRAY('2020-08-01', '2020-08-12', INTERVAL 1 DAY)) AS date_value
 ),
 
 acc_created AS (
@@ -104,20 +112,24 @@ acc_trans AS (
 
 acc_trans_7d AS (
   SELECT 
-    account_id_hashed,
-    SUM(transactions_num) AS transactions_last_7d
-  FROM `analytics-take-home-test.monzo_datawarehouse.account_transactions`
-  WHERE date BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY) AND CURRENT_DATE()
-  GROUP BY account_id_hashed
+    ds.metric_date,
+    att.account_id_hashed,
+    SUM(att.transactions_num) AS transactions_last_7d
+  FROM date_spine ds
+  CROSS JOIN `analytics-take-home-test.monzo_datawarehouse.account_transactions` att
+  WHERE att.date BETWEEN DATE_SUB(ds.metric_date, INTERVAL 7 DAY) AND ds.metric_date
+  GROUP BY ds.metric_date, att.account_id_hashed
 ),
 
 acc_trans_30d AS (
   SELECT 
-    account_id_hashed,
-    SUM(transactions_num) AS transactions_last_30d
-  FROM `analytics-take-home-test.monzo_datawarehouse.account_transactions`
-  WHERE date BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY) AND CURRENT_DATE()
-  GROUP BY account_id_hashed
+    ds.metric_date,
+    att.account_id_hashed,
+    SUM(att.transactions_num) AS transactions_last_30d
+  FROM date_spine ds
+  CROSS JOIN `analytics-take-home-test.monzo_datawarehouse.account_transactions` att
+  WHERE att.date BETWEEN DATE_SUB(ds.metric_date, INTERVAL 30 DAY) AND ds.metric_date
+  GROUP BY ds.metric_date, att.account_id_hashed
 )
 
 SELECT 
@@ -167,7 +179,8 @@ CROSS JOIN acc_created acc
 LEFT JOIN acc_closed clo ON acc.account_id_hashed = clo.account_id_hashed
 LEFT JOIN acc_reopened reo ON acc.account_id_hashed = reo.account_id_hashed
 LEFT JOIN acc_trans tra ON acc.account_id_hashed = tra.account_id_hashed
-LEFT JOIN acc_trans_7d t7d ON acc.account_id_hashed = t7d.account_id_hashed
-LEFT JOIN acc_trans_30d t30d ON acc.account_id_hashed = t30d.account_id_hashed
+LEFT JOIN acc_trans_7d t7d ON ds.metric_date = t7d.metric_date AND acc.account_id_hashed = t7d.account_id_hashed
+LEFT JOIN acc_trans_30d t30d ON ds.metric_date = t30d.metric_date AND acc.account_id_hashed = t30d.account_id_hashed
 ;
+
 

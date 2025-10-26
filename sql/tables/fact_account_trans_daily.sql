@@ -37,6 +37,9 @@ OPTIONS(
 
 -- ETL Query to populate fact_account_trans_daily table
 -- This query should be run daily to update account-level transaction metrics
+
+-- DECLARE TARGET_DATE DATE DEFAULT '2020-08-11';
+
 INSERT INTO fact_account_trans_daily (
   trans_date,
   account_id_hashed,
@@ -55,53 +58,53 @@ INSERT INTO fact_account_trans_daily (
 WITH account_base AS (
   -- Get all account information with creation details
   SELECT 
-    ac.account_id_hashed,
-    ac.user_id_hashed,
-    ac.account_type,
-    ac.created_ts
-  FROM `analytics-take-home-test.monzo_datawarehouse.account_created` ac
+    acc.account_id_hashed,
+    acc.user_id_hashed,
+    acc.account_type,
+    acc.created_ts
+  FROM `analytics-take-home-test.monzo_datawarehouse.account_created` acc
 ),
 
 account_status_logic AS (
   -- Determine account status for each transaction date
   SELECT 
-    ab.account_id_hashed,
-    ab.user_id_hashed,
-    ab.account_type,
-    ab.created_ts,
+    aba.account_id_hashed,
+    aba.user_id_hashed,
+    aba.account_type,
+    aba.created_ts,
     acl.closed_ts,
-    ar.reopened_ts,
+    are.reopened_ts,
     -- Determine status based on closure/reopening events
     CASE 
       WHEN acl.closed_ts IS NULL THEN 'OPEN'
-      WHEN ar.reopened_ts IS NULL THEN 'CLOSED'
-      WHEN ar.reopened_ts > acl.closed_ts THEN 'OPEN'
+      WHEN are.reopened_ts IS NULL THEN 'CLOSED'
+      WHEN are.reopened_ts > acl.closed_ts THEN 'OPEN'
       ELSE 'CLOSED'
     END AS current_status
-  FROM account_base ab
+  FROM account_base aba
   LEFT JOIN `analytics-take-home-test.monzo_datawarehouse.account_closed` acl
-    ON ab.account_id_hashed = acl.account_id_hashed
-  LEFT JOIN `analytics-take-home-test.monzo_datawarehouse.account_reopened` ar
-    ON ab.account_id_hashed = ar.account_id_hashed
+    ON aba.account_id_hashed = acl.account_id_hashed
+  LEFT JOIN `analytics-take-home-test.monzo_datawarehouse.account_reopened` are
+    ON aba.account_id_hashed = are.account_id_hashed
 ),
 
 daily_transactions AS (
   -- Get daily transaction data with account details
   SELECT 
-    at.date AS trans_date,
-    at.account_id_hashed,
+    atr.date AS trans_date,
+    atr.account_id_hashed,
     asl.user_id_hashed,
     asl.account_type,
     asl.current_status AS account_status,
-    at.transactions_num,
+    atr.transactions_num,
     asl.created_ts
-  FROM `analytics-take-home-test.monzo_datawarehouse.account_transactions` at
+  FROM `analytics-take-home-test.monzo_datawarehouse.account_transactions` atr
   INNER JOIN account_status_logic asl 
-    ON at.account_id_hashed = asl.account_id_hashed
+    ON atr.account_id_hashed = asl.account_id_hashed
   WHERE 
-    at.date IS NOT NULL 
-    AND at.transactions_num IS NOT NULL
-    AND at.transactions_num > 0
+    atr.date IS NOT NULL 
+    AND atr.transactions_num IS NOT NULL
+    AND atr.transactions_num > 0
 ),
 
 first_transaction_dates AS (

@@ -70,39 +70,72 @@ OPTIONS(
 );
 
 
+-- ETL Query to populate dim_accounts table
+-- BACKFILL VERSION: This query runs for date range 2020-08-01 to 2020-08-12
+-- This creates daily snapshots of account dimension with point-in-time metrics
+
+-- For single date: DECLARE TARGET_DATE DATE DEFAULT '2020-08-12';
+-- For backfill: Use date range generation below
+
 -- TRUNCATE TABLE GD_take_home_task.dim_accounts;
 INSERT INTO GD_take_home_task.dim_accounts
-WITH date_spine AS (
-  -- Generate date range for daily snapshots
-  SELECT CURRENT_DATE() AS metric_date
+
+WITH 
+-- Generate date range for backfill: 2020-08-01 to 2020-08-12 (12 days)
+date_spine AS (
+  SELECT date_value AS metric_date
+  FROM UNNEST(GENERATE_DATE_ARRAY('2020-08-01', '2020-08-12', INTERVAL 1 DAY)) AS date_value
 ),
+
+-- Calculate transaction metrics as of each metric date
 transaction_metrics AS (
-  -- Calculate all transaction metrics per account
   SELECT 
-    account_id_hashed,
-    SUM(transactions_num) AS total_transactions,
-    COUNT(DISTINCT date) AS total_transaction_days,
-    MIN(date) AS first_transaction_date,
-    MAX(date) AS last_transaction_date,
-    ROUND(AVG(transactions_num), 2) AS avg_daily_transactions,
-    MAX(transactions_num) AS max_daily_transactions,
-    -- Transactions in last 7 days
-    SUM(CASE 
-      WHEN date BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY) AND CURRENT_DATE() 
-      THEN transactions_num 
-      ELSE 0 
-    END) AS transactions_last_7d,
-    -- Transactions in last 30 days
-    SUM(CASE 
-      WHEN date BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY) AND CURRENT_DATE() 
-      THEN transactions_num 
-      ELSE 0 
-    END) AS transactions_last_30d,
-    -- Days since last transaction
-    DATE_DIFF(CURRENT_DATE(), MAX(date), DAY) AS days_since_last_transaction
-  FROM `analytics-take-home-test.monzo_datawarehouse.account_transactions`
-  WHERE date IS NOT NULL AND transactions_num IS NOT NULL
-  GROUP BY account_id_hashed
+    ds.metric_date,
+    att.account_id_hashed,
+    -- Cumulative transactions up to metric date
+    SUM(att.transactions_num) AS total_transactions,
+    COUNT(DISTINCT att.date) AS total_transaction_days,
+    MIN(att.date) AS first_transaction_date,
+    MAX(att.date) AS last_transaction_date,
+    ROUND(AVG(att.transactions_num), 2) AS avg_daily_transactions,
+    MAX(att.transactions_num) AS max_daily_transactions,
+    -- Days since last transaction as of metric date
+    DATE_DIFF(ds.metric_date, MAX(att.date), DAY) AS days_since_last_transaction
+  FROM date_spine ds
+  CROSS JOIN `analytics-take-home-test.monzo_datawarehouse.account_transactions` att
+  WHERE 
+    att.date <= ds.metric_date  -- Only transactions up to metric date
+    AND att.date IS NOT NULL 
+    AND att.transactions_num IS NOT NULL
+  GROUP BY ds.metric_date, att.account_id_hashed
+),
+
+-- Calculate 7-day rolling transactions as of each metric date
+transactions_7d AS (
+  SELECT 
+    ds.metric_date,
+    att.account_id_hashed,
+    SUM(att.transactions_num) AS transactions_last_7d
+  FROM date_spine ds
+  CROSS JOIN `analytics-take-home-test.monzo_datawarehouse.account_transactions` att
+  WHERE 
+    att.date BETWEEN DATE_SUB(ds.metric_date, INTERVAL 6 DAY) AND ds.metric_date
+    AND att.transactions_num > 0
+  GROUP BY ds.metric_date, att.account_id_hashed
+),
+
+-- Calculate 30-day rolling transactions as of each metric date
+transactions_30d AS (
+  SELECT 
+    ds.metric_date,
+    att.account_id_hashed,
+    SUM(att.transactions_num) AS transactions_last_30d
+  FROM date_spine ds
+  CROSS JOIN `analytics-take-home-test.monzo_datawarehouse.account_transactions` att
+  WHERE 
+    att.date BETWEEN DATE_SUB(ds.metric_date, INTERVAL 29 DAY) AND ds.metric_date
+    AND att.transactions_num > 0
+  GROUP BY ds.metric_date, att.account_id_hashed
 )
 
 SELECT
@@ -111,16 +144,30 @@ SELECT
   ac.user_id_hashed,
   ac.account_type,
   ac.created_ts,
-  MIN(acl.closed_ts) AS first_closed_ts,
-  MAX(ar.reopened_ts) AS last_reopened_ts,
+  -- Get first closure that happened before or on metric date
+  MIN(CASE 
+    WHEN DATE(acl.closed_ts) <= ds.metric_date THEN acl.closed_ts 
+    ELSE NULL 
+  END) AS first_closed_ts,
+  
+  -- Get last reopening that happened before or on metric date
+  MAX(CASE 
+    WHEN DATE(ar.reopened_ts) <= ds.metric_date THEN ar.reopened_ts 
+    ELSE NULL 
+  END) AS last_reopened_ts,
+  -- Determine account status as of metric date
   CASE
-    WHEN MAX(ar.reopened_ts) > MIN(acl.closed_ts) THEN 'OPEN'
-    WHEN COUNT(acl.closed_ts) > 0 THEN 'CLOSED'
+    WHEN MAX(CASE WHEN DATE(ar.reopened_ts) <= ds.metric_date THEN ar.reopened_ts END) > 
+         MIN(CASE WHEN DATE(acl.closed_ts) <= ds.metric_date THEN acl.closed_ts END) THEN 'OPEN'
+    WHEN COUNT(CASE WHEN DATE(acl.closed_ts) <= ds.metric_date THEN acl.closed_ts END) > 0 THEN 'CLOSED'
     ELSE 'OPEN'
   END AS current_status,
-  COUNT(DISTINCT acl.closed_ts) AS total_closures,
-  COUNT(DISTINCT ar.reopened_ts) AS total_reopenings,
-  DATE_DIFF(CURRENT_DATE(), DATE(ac.created_ts), DAY) AS days_active,
+  
+  -- Count closures and reopenings up to metric date
+  COUNT(CASE WHEN DATE(acl.closed_ts) <= ds.metric_date THEN acl.closed_ts END) AS total_closures,
+  COUNT(CASE WHEN DATE(ar.reopened_ts) <= ds.metric_date THEN ar.reopened_ts END) AS total_reopenings,
+  -- Days active as of metric date
+  DATE_DIFF(ds.metric_date, DATE(ac.created_ts), DAY) AS days_active,
   
   -- Transaction metrics (with defaults for accounts with no transactions)
   COALESCE(tm.total_transactions, 0) AS total_transactions,
@@ -129,8 +176,8 @@ SELECT
   tm.last_transaction_date,
   tm.avg_daily_transactions,
   COALESCE(tm.max_daily_transactions, 0) AS max_daily_transactions,
-  COALESCE(tm.transactions_last_7d, 0) AS transactions_last_7d,
-  COALESCE(tm.transactions_last_30d, 0) AS transactions_last_30d,
+  COALESCE(t7d.transactions_last_7d, 0) AS transactions_last_7d,
+  COALESCE(t30d.transactions_last_30d, 0) AS transactions_last_30d,
   tm.days_since_last_transaction,
   
   CURRENT_TIMESTAMP() AS load_timestamp
@@ -146,7 +193,15 @@ LEFT JOIN `analytics-take-home-test.monzo_datawarehouse.account_reopened` ar
 ON ac.account_id_hashed = ar.account_id_hashed
 
 LEFT JOIN transaction_metrics tm 
-ON ac.account_id_hashed = tm.account_id_hashed
+  ON ds.metric_date = tm.metric_date AND ac.account_id_hashed = tm.account_id_hashed
+LEFT JOIN transactions_7d t7d 
+  ON ds.metric_date = t7d.metric_date AND ac.account_id_hashed = t7d.account_id_hashed
+LEFT JOIN transactions_30d t30d 
+  ON ds.metric_date = t30d.metric_date AND ac.account_id_hashed = t30d.account_id_hashed
+
+WHERE 
+  -- Only include accounts that existed as of the metric date
+  DATE(ac.created_ts) <= ds.metric_date
 
 GROUP BY   
   ds.metric_date,
@@ -160,7 +215,7 @@ GROUP BY
   tm.last_transaction_date,
   tm.avg_daily_transactions,
   tm.max_daily_transactions,
-  tm.transactions_last_7d,
-  tm.transactions_last_30d,
-  tm.days_since_last_transaction
+  t7d.transactions_last_7d,
+  t30d.transactions_last_30d,
+  tm.days_since_last_transaction;
 ;
