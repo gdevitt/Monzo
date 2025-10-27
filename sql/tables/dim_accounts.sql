@@ -18,7 +18,7 @@ Pull Request ID: provide GIT pull request if available.
 
 
 -- DDL for table dim_accounts
-CREATE TABLE dim_accounts
+CREATE TABLE GD_take_home_task.dim_accounts
 (
   metric_date DATE NOT NULL,
   account_id_hashed STRING NOT NULL,
@@ -50,26 +50,6 @@ OPTIONS(
 );
 
 
--- DDL for table dim_accounts
-CREATE TABLE GD_take_home_task.dim_accounts
-(
-  account_id_hashed STRING NOT NULL,
-  user_id_hashed STRING NOT NULL,
-  account_type STRING,
-  created_ts TIMESTAMP NOT NULL,
-  first_closed_ts TIMESTAMP,
-  last_reopened_ts TIMESTAMP,
-  current_status STRING NOT NULL,
-  total_closures INT64 DEFAULT 0,
-  total_reopenings INT64 DEFAULT 0,
-  days_active INT64,
-  load_timestamp TIMESTAMP NOT NULL 
-)
-OPTIONS(
-  description="Dimension table containing consolidated account information with lifecycle status"
-);
-
-
 -- ETL Query to populate dim_accounts table
 -- BACKFILL VERSION: This query runs for date range 2020-08-01 to 2020-08-12
 -- This creates daily snapshots of account dimension with point-in-time metrics
@@ -79,7 +59,6 @@ OPTIONS(
 
 -- TRUNCATE TABLE GD_take_home_task.dim_accounts;
 INSERT INTO GD_take_home_task.dim_accounts
-
 WITH 
 -- Generate date range for backfill: 2020-08-01 to 2020-08-12 (12 days)
 date_spine AS (
@@ -142,7 +121,12 @@ SELECT
   ds.metric_date,
   ac.account_id_hashed,
   ac.user_id_hashed,
-  ac.account_type,
+  case 
+    when ac.account_type = 'uk_retail_pot' then 'Savings AC'
+    when ac.account_type = 'uk_retail_joint' then 'Joint AC'
+    when ac.account_type = 'uk_retail' then 'Current AC'
+    else 'Unclassified AC'
+  end as account_type,
   ac.created_ts,
   -- Get first closure that happened before or on metric date
   MIN(CASE 
@@ -217,5 +201,5 @@ GROUP BY
   tm.max_daily_transactions,
   t7d.transactions_last_7d,
   t30d.transactions_last_30d,
-  tm.days_since_last_transaction;
-;
+  tm.days_since_last_transaction
+  ;
