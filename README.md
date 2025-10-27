@@ -247,5 +247,3 @@ This project is part of Monzo's data infrastructure. Please refer to company pol
 For questions or support, please refer to the data engineering team documentation or create an issue in this repository.
 
 ---
-
-For questions or support, please refer to the data engineering team documentation or create an issue in this repository.
